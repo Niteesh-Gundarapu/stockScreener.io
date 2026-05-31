@@ -1,8 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const PortfolioService = require('../services/portfolioService');
-
-const portfolioService = new PortfolioService();
+const portfolioService = require('../services/portfolioService');
 
 // Create portfolio
 router.post('/create', async (req, res) => {
@@ -83,6 +81,17 @@ router.get('/:userId/alerts', async (req, res) => {
   try {
     const alerts = await portfolioService.getPriceAlerts(req.params.userId);
     res.json({ success: true, alerts });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Refresh portfolio with live market prices
+router.post('/refresh', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    const portfolio = await portfolioService.refreshPortfolio(userId);
+    res.json({ success: true, portfolio });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }

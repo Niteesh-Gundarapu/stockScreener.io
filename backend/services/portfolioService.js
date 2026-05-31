@@ -1,234 +1,473 @@
-const Portfolio = require('../models/Portfolio');
-const Trade = require('../models/Trade');
-const PriceAlert = require('../models/PriceAlert');
+// backend/services/portfolioService.js
+// Portfolio management with PostgreSQL/Prisma
+// Implements batch processing and ACID transactions
+
+const pino = require('pino');
+const { prisma } = require('../db/client');
+const marketDataService = require('./marketDataService');
+
+const logger = pino();
 
 class PortfolioService {
   constructor() {
-    this.initialBalance = 100000; // ₹100,000 virtual currency
+    this.initialBalance = 100000; // ₹100,000 virtual trading
   }
 
-  async createPortfolio(userId, username) {
-    try {
-      const portfolio = new Portfolio({
-        userId,
-        username,
-        cash: this.initialBalance,
-        positions: [],
-        totalValue: this.initialBalance,
-        totalGain: 0,
-        totalGainPercent: 0,
-        totalInvested: 0
-      });
-      await portfolio.save();
-      return portfolio;
-    } catch (error) {
-      throw new Error(`Failed to create portfolio: ${error.message}`);
-    }
-  }
-
+  /**
+   * Get portfolio with all positions
+   */
   async getPortfolio(userId) {
     try {
-      const portfolio = await Portfolio.findOne({ userId }).populate('positions');
+      const portfolio = await prisma.portfolio.findUnique({
+        where: { userId },
+        include: {
+          positions: true,
+        },
+      });
+
+      if (!portfolio) {
+        throw new Error('Portfolio not found');
+      }
+
       return portfolio;
     } catch (error) {
-      throw new Error(`Failed to fetch portfolio: ${error.message}`);
+      logger.error({ userId, error: error.message }, 'Failed to get portfolio');
+      throw error;
     }
   }
 
+  /**
+   * Buy stock (with ACID transaction)
+   * Ensures: trade recorded + portfolio updated atomically
+   */
   async buyStock(userId, ticker, quantity, currentPrice) {
     try {
-      const portfolio = await Portfolio.findOne({ userId });
-      if (!portfolio) throw new Error('Portfolio not found');
-
       const totalCost = quantity * currentPrice;
-      if (portfolio.cash < totalCost) {
-        throw new Error('Insufficient cash balance');
-      }
 
-      // Create trade record
-      const trade = new Trade({
-        userId,
-        ticker,
-        type: 'BUY',
-        quantity,
-        price: currentPrice,
-        totalAmount: totalCost,
-        timestamp: new Date()
-      });
-      await trade.save();
-
-      // Update portfolio
-      portfolio.cash -= totalCost;
-      portfolio.totalInvested += totalCost;
-
-      // Add or update position
-      const existingPosition = portfolio.positions.find(p => p.ticker === ticker);
-      if (existingPosition) {
-        const newQuantity = existingPosition.quantity + quantity;
-        const newAvgPrice = (existingPosition.avgPrice * existingPosition.quantity + currentPrice * quantity) / newQuantity;
-        existingPosition.quantity = newQuantity;
-        existingPosition.avgPrice = newAvgPrice;
-      } else {
-        portfolio.positions.push({
-          ticker,
-          quantity,
-          avgPrice: currentPrice,
-          currentPrice,
-          gainLoss: 0,
-          gainLossPercent: 0
+      // Use Prisma transaction for atomicity
+      const result = await prisma.$transaction(async (tx) => {
+        // 1. Get portfolio
+        const portfolio = await tx.portfolio.findUnique({
+          where: { userId },
         });
-      }
 
-      await portfolio.save();
-      return { success: true, portfolio, trade };
+        if (!portfolio) throw new Error('Portfolio not found');
+        if (portfolio.cashBalance < totalCost) {
+          throw new Error('Insufficient cash balance');
+        }
+
+        // 2. Create trade (immutable record)
+        const trade = await tx.trade.create({
+          data: {
+            portfolioId: portfolio.id,
+            userId,
+            ticker,
+            tradeType: 'BUY',
+            quantity,
+            price: currentPrice,
+            totalAmount: totalCost,
+            status: 'FILLED',
+            executedAt: new Date(),
+          },
+        });
+
+        // 3. Update or create position
+        const existingPosition = await tx.position.findUnique({
+          where: {
+            portfolioId_ticker: {
+              portfolioId: portfolio.id,
+              ticker,
+            },
+          },
+        });
+
+        let position;
+        if (existingPosition) {
+          // Update average price for existing position
+          const newQuantity = existingPosition.quantity + quantity;
+          const newAvgPrice =
+            (existingPosition.avgPrice * existingPosition.quantity + currentPrice * quantity) /
+            newQuantity;
+
+          position = await tx.position.update({
+            where: { id: existingPosition.id },
+            data: {
+              quantity: newQuantity,
+              avgPrice: newAvgPrice,
+              currentPrice,
+              updatedAt: new Date(),
+            },
+          });
+        } else {
+          // Create new position
+          position = await tx.position.create({
+            data: {
+              portfolioId: portfolio.id,
+              ticker,
+              quantity,
+              avgPrice: currentPrice,
+              currentPrice,
+              buyDate: new Date(),
+            },
+          });
+        }
+
+        // 4. Update portfolio balances
+        const updatedPortfolio = await tx.portfolio.update({
+          where: { id: portfolio.id },
+          data: {
+            cashBalance: { decrement: totalCost },
+            totalInvested: { increment: totalCost },
+            updatedAt: new Date(),
+          },
+          include: { positions: true },
+        });
+
+        return { trade, position, portfolio: updatedPortfolio };
+      });
+
+      logger.info(
+        { userId, ticker, quantity, price: currentPrice },
+        'Buy executed successfully'
+      );
+      return { success: true, ...result };
     } catch (error) {
-      throw new Error(`Buy operation failed: ${error.message}`);
+      logger.error({ userId, ticker, error: error.message }, 'Buy execution failed');
+      throw error;
     }
   }
 
+  /**
+   * Sell stock (with ACID transaction)
+   */
   async sellStock(userId, ticker, quantity, currentPrice) {
     try {
-      const portfolio = await Portfolio.findOne({ userId });
-      if (!portfolio) throw new Error('Portfolio not found');
-
-      const position = portfolio.positions.find(p => p.ticker === ticker);
-      if (!position || position.quantity < quantity) {
-        throw new Error('Insufficient stock quantity');
-      }
-
       const totalProceeds = quantity * currentPrice;
 
-      // Create trade record
-      const trade = new Trade({
-        userId,
-        ticker,
-        type: 'SELL',
-        quantity,
-        price: currentPrice,
-        totalAmount: totalProceeds,
-        timestamp: new Date()
+      const result = await prisma.$transaction(async (tx) => {
+        // 1. Get portfolio
+        const portfolio = await tx.portfolio.findUnique({
+          where: { userId },
+        });
+
+        if (!portfolio) throw new Error('Portfolio not found');
+
+        // 2. Check position
+        const position = await tx.position.findUnique({
+          where: {
+            portfolioId_ticker: {
+              portfolioId: portfolio.id,
+              ticker,
+            },
+          },
+        });
+
+        if (!position || position.quantity < quantity) {
+          throw new Error('Insufficient stock quantity');
+        }
+
+        // 3. Create trade
+        const costBasis = position.avgPrice * quantity;
+        const gain = totalProceeds - costBasis;
+
+        const trade = await tx.trade.create({
+          data: {
+            portfolioId: portfolio.id,
+            userId,
+            ticker,
+            tradeType: 'SELL',
+            quantity,
+            price: currentPrice,
+            totalAmount: totalProceeds,
+            status: 'FILLED',
+            executedAt: new Date(),
+          },
+        });
+
+        // 4. Update position or delete if fully sold
+        let updatedPosition;
+        if (position.quantity === quantity) {
+          // Fully sold - delete position
+          await tx.position.delete({
+            where: { id: position.id },
+          });
+          updatedPosition = null;
+        } else {
+          // Partial sell - update position
+          updatedPosition = await tx.position.update({
+            where: { id: position.id },
+            data: {
+              quantity: { decrement: quantity },
+              updatedAt: new Date(),
+            },
+          });
+        }
+
+        // 5. Update portfolio
+        const updatedPortfolio = await tx.portfolio.update({
+          where: { id: portfolio.id },
+          data: {
+            cashBalance: { increment: totalProceeds },
+            totalInvested: { decrement: costBasis },
+            totalGainLoss: { increment: gain },
+            updatedAt: new Date(),
+          },
+          include: { positions: true },
+        });
+
+        return { trade, position: updatedPosition, portfolio: updatedPortfolio, gain };
       });
-      await trade.save();
 
-      // Update portfolio
-      portfolio.cash += totalProceeds;
+      logger.info(
+        { userId, ticker, quantity, price: currentPrice, gain: result.gain },
+        'Sell executed successfully'
+      );
+      return { success: true, ...result };
+    } catch (error) {
+      logger.error({ userId, ticker, error: error.message }, 'Sell execution failed');
+      throw error;
+    }
+  }
 
-      // Update position
-      position.quantity -= quantity;
-      if (position.quantity === 0) {
-        portfolio.positions = portfolio.positions.filter(p => p.ticker !== ticker);
+  /**
+   * BATCH UPDATE: Refresh all user portfolios with latest prices
+   * Optimized for 1,000+ concurrent users
+   * Fetches all prices once, updates all positions atomically
+   */
+  async updatePortfolioValuesBatch(userIds = null) {
+    try {
+      // Get all active portfolios
+      const portfolios = userIds
+        ? await prisma.portfolio.findMany({
+            where: { userId: { in: userIds } },
+            include: { positions: true },
+          })
+        : await prisma.portfolio.findMany({
+            include: { positions: true },
+          });
+
+      if (portfolios.length === 0) {
+        logger.info('No portfolios to update');
+        return [];
       }
 
-      await portfolio.save();
-      return { success: true, portfolio, trade };
-    } catch (error) {
-      throw new Error(`Sell operation failed: ${error.message}`);
-    }
-  }
-
-  async updatePortfolioValues(userId, currentPrices) {
-    try {
-      const portfolio = await Portfolio.findOne({ userId });
-      if (!portfolio) return null;
-
-      let totalPortfolioValue = portfolio.cash;
-      let totalGain = 0;
-
-      portfolio.positions.forEach(position => {
-        const currentPrice = currentPrices[position.ticker] || position.currentPrice;
-        const positionValue = position.quantity * currentPrice;
-        const costBasis = position.quantity * position.avgPrice;
-        const positionGain = positionValue - costBasis;
-
-        position.currentPrice = currentPrice;
-        position.gainLoss = positionGain;
-        position.gainLossPercent = (positionGain / costBasis) * 100 || 0;
-
-        totalPortfolioValue += positionValue;
-        totalGain += positionGain;
+      // 1. Collect all unique tickers
+      const allTickers = new Set();
+      portfolios.forEach((p) => {
+        p.positions.forEach((pos) => allTickers.add(pos.ticker));
       });
 
-      portfolio.totalValue = totalPortfolioValue;
-      portfolio.totalGain = totalGain;
-      portfolio.totalGainPercent = (totalGain / this.initialBalance) * 100 || 0;
-      portfolio.lastUpdated = new Date();
+      if (allTickers.size === 0) {
+        logger.info('No positions to update');
+        return portfolios;
+      }
 
-      await portfolio.save();
-      return portfolio;
+      // 2. BATCH FETCH all prices at once (single API call)
+      const tickers = Array.from(allTickers);
+      logger.info({ tickersCount: tickers.length }, 'Batch fetching prices');
+      const priceUpdates = await marketDataService.getPricesBatch(tickers);
+
+      // Convert to map for O(1) lookup
+      const priceMap = new Map();
+      priceUpdates.forEach((p) => {
+        priceMap.set(p.ticker, p);
+      });
+
+      // 3. BATCH UPDATE all positions
+      const updatePromises = [];
+      const updatedPortfolios = [];
+
+      for (const portfolio of portfolios) {
+        let totalPortfolioValue = Number(portfolio.cashBalance);
+        let totalGainLoss = 0;
+
+        const positionUpdates = [];
+
+        for (const position of portfolio.positions) {
+          const latestPrice = priceMap.get(position.ticker);
+          if (!latestPrice) continue;
+
+          const currentPrice = latestPrice.price;
+          const positionValue = position.quantity * currentPrice;
+          const costBasis = position.quantity * Number(position.avgPrice);
+          const positionGain = positionValue - costBasis;
+          const gainPercent = costBasis > 0 ? (positionGain / costBasis) * 100 : 0;
+
+          positionUpdates.push({
+            id: position.id,
+            currentPrice,
+            gainLoss: positionGain,
+            gainLossPercent: gainPercent,
+          });
+
+          totalPortfolioValue += positionValue;
+          totalGainLoss += positionGain;
+        }
+
+        // Update all positions for this portfolio
+        if (positionUpdates.length > 0) {
+          updatePromises.push(
+            prisma.$transaction(
+              positionUpdates.map((update) =>
+                prisma.position.update({
+                  where: { id: update.id },
+                  data: {
+                    currentPrice: update.currentPrice,
+                    gainLoss: update.gainLoss,
+                    gainLossPercent: update.gainLossPercent,
+                  },
+                })
+              )
+            )
+          );
+        }
+
+        // Update portfolio totals
+        const gainPercent =
+          this.initialBalance > 0 ? (totalGainLoss / this.initialBalance) * 100 : 0;
+
+        updatePromises.push(
+          prisma.portfolio.update({
+            where: { id: portfolio.id },
+            data: {
+              totalValue: totalPortfolioValue,
+              totalGainLoss,
+              totalGainLossPercent: gainPercent,
+              updatedAt: new Date(),
+            },
+          })
+        );
+      }
+
+      // Execute all updates in parallel
+      const results = await Promise.all(updatePromises);
+      logger.info(
+        { portfolioCount: portfolios.length, updateCount: updatePromises.length },
+        'Batch portfolio update complete'
+      );
+
+      return portfolios;
     } catch (error) {
-      throw new Error(`Failed to update portfolio values: ${error.message}`);
+      logger.error({ error: error.message }, 'Batch portfolio update failed');
+      throw error;
     }
   }
 
+  /**
+   * Get trade history
+   */
   async getTradeHistory(userId, limit = 50) {
     try {
-      const trades = await Trade.find({ userId }).sort({ timestamp: -1 }).limit(limit);
+      const portfolio = await prisma.portfolio.findUnique({ where: { userId } });
+      if (!portfolio) throw new Error('Portfolio not found');
+
+      const trades = await prisma.trade.findMany({
+        where: { portfolioId: portfolio.id },
+        orderBy: { executedAt: 'desc' },
+        take: limit,
+      });
+
       return trades;
     } catch (error) {
-      throw new Error(`Failed to fetch trade history: ${error.message}`);
+      logger.error({ userId, error: error.message }, 'Failed to get trade history');
+      throw error;
     }
   }
 
+  /**
+   * Get portfolio statistics
+   */
   async getPortfolioStats(userId) {
     try {
-      const portfolio = await Portfolio.findOne({ userId });
-      const trades = await Trade.find({ userId });
+      const portfolio = await prisma.portfolio.findUnique({
+        where: { userId },
+        include: { positions: true },
+      });
+
+      if (!portfolio) throw new Error('Portfolio not found');
+
+      const trades = await prisma.trade.findMany({
+        where: { userId },
+      });
 
       const totalTrades = trades.length;
-      const buyTrades = trades.filter(t => t.type === 'BUY');
-      const sellTrades = trades.filter(t => t.type === 'SELL');
+      const buyTrades = trades.filter((t) => t.tradeType === 'BUY').length;
+      const sellTrades = trades.filter((t) => t.tradeType === 'SELL').length;
 
-      const winningTrades = sellTrades.filter(sell => {
-        const buyPrice = buyTrades.find(b => b.ticker === sell.ticker)?.price || 0;
-        return sell.price > buyPrice;
-      }).length;
-
-      const winRate = totalTrades > 0 ? (winningTrades / totalTrades * 100).toFixed(2) : 0;
+      const roi = ((portfolio.totalGainLoss / this.initialBalance) * 100).toFixed(2);
 
       return {
         totalTrades,
-        buyTrades: buyTrades.length,
-        sellTrades: sellTrades.length,
-        winningTrades,
-        winRate,
+        buyTrades,
+        sellTrades,
+        currentCash: portfolio.cashBalance,
+        totalValue: portfolio.totalValue,
         totalInvested: portfolio.totalInvested,
-        currentValue: portfolio.totalValue,
-        totalGain: portfolio.totalGain,
-        roi: ((portfolio.totalGain / this.initialBalance) * 100).toFixed(2)
+        totalGainLoss: portfolio.totalGainLoss,
+        roi,
+        positionCount: portfolio.positions.length,
       };
     } catch (error) {
-      throw new Error(`Failed to get portfolio stats: ${error.message}`);
+      logger.error({ userId, error: error.message }, 'Failed to get portfolio stats');
+      throw error;
     }
   }
 
-  async createPriceAlert(userId, ticker, targetPrice, alertType = 'ABOVE') {
+  /**
+   * Create price alert
+   */
+  async createPriceAlert(userId, ticker, targetPrice, alertType) {
     try {
-      const alert = new PriceAlert({
-        userId,
-        ticker,
-        targetPrice,
-        alertType,
-        createdAt: new Date()
+      const alert = await prisma.priceAlert.create({
+        data: {
+          userId,
+          ticker,
+          targetPrice,
+          alertType,
+          isActive: true,
+          createdAt: new Date(),
+        },
       });
-      await alert.save();
+
+      logger.info({ userId, ticker, targetPrice }, 'Price alert created');
       return alert;
     } catch (error) {
-      throw new Error(`Failed to create price alert: ${error.message}`);
+      logger.error({ error: error.message }, 'Failed to create price alert');
+      throw error;
     }
   }
 
+  /**
+   * Get active price alerts
+   */
   async getPriceAlerts(userId) {
     try {
-      const alerts = await PriceAlert.find({ userId, isActive: true });
+      const alerts = await prisma.priceAlert.findMany({
+        where: {
+          userId,
+          isActive: true,
+        },
+      });
+
       return alerts;
     } catch (error) {
-      throw new Error(`Failed to fetch price alerts: ${error.message}`);
+      logger.error({ userId, error: error.message }, 'Failed to get price alerts');
+      throw error;
     }
   }
 
-  async checkPriceAlerts(ticker, currentPrice) {
+  /**
+   * Check and trigger price alerts (called by background worker)
+   */
+  async checkAndTriggerAlerts(ticker, currentPrice) {
     try {
-      const alerts = await PriceAlert.find({ ticker, isActive: true });
+      const alerts = await prisma.priceAlert.findMany({
+        where: {
+          ticker,
+          isActive: true,
+        },
+      });
+
       const triggeredAlerts = [];
 
       for (const alert of alerts) {
@@ -241,19 +480,32 @@ class PortfolioService {
         }
 
         if (shouldTrigger) {
-          alert.isActive = false;
-          alert.triggeredAt = new Date();
-          await alert.save();
+          // Deactivate alert
+          await prisma.priceAlert.update({
+            where: { id: alert.id },
+            data: {
+              isActive: false,
+              triggeredAt: new Date(),
+            },
+          });
+
           triggeredAlerts.push(alert);
         }
       }
 
+      if (triggeredAlerts.length > 0) {
+        logger.info(
+          { ticker, price: currentPrice, triggeredCount: triggeredAlerts.length },
+          'Price alerts triggered'
+        );
+      }
+
       return triggeredAlerts;
     } catch (error) {
-      console.error('Error checking price alerts:', error.message);
-      return [];
+      logger.error({ ticker, error: error.message }, 'Failed to check price alerts');
+      throw error;
     }
   }
 }
 
-module.exports = PortfolioService;
+module.exports = new PortfolioService();

@@ -1,65 +1,98 @@
-const { getYahooFinance } = require('../utils/yahooClient');
+// Refactored: Single master loop + fan-out pattern
+// Prevents memory leaks and rate limit exhaustion
+// Market hours aware (9:15 AM - 3:30 PM IST only)
+
+const pino = require('pino');
+const marketDataService = require('./marketDataService');
+const { isMarketOpen, getMinutesUntilClose } = require('../utils/marketHours');
+
+const logger = pino();
 
 class WebSocketService {
   constructor(io) {
     this.io = io;
-    this.priceCache = new Map();
-    this.subscriptions = new Map(); // Map of ticker -> Set of socket IDs
+    this.subscriptions = new Map(); // ticker -> Set<socketId>
+    this.masterLoopInterval = null;
+    this.updateInterval = process.env.WS_UPDATE_INTERVAL_MS || 5000;
+    this.activeSockets = new Set();
   }
 
+  /**
+   * Initialize WebSocket event handlers
+   */
   setupConnections() {
     this.io.on('connection', (socket) => {
-      console.log(`[WS] Client connected: ${socket.id}`);
+      this.activeSockets.add(socket.id);
+      logger.info({ socketId: socket.id, totalConnections: this.activeSockets.size }, '[WS] Client connected');
 
+      // Client subscribes to ticker
       socket.on('subscribe', (ticker) => {
         this._subscribeTicker(socket, ticker);
       });
 
+      // Client unsubscribes from ticker
       socket.on('unsubscribe', (ticker) => {
         this._unsubscribeTicker(socket, ticker);
       });
 
+      // Client requests current price
+      socket.on('get-price', async (ticker, callback) => {
+        try {
+          const price = await marketDataService.getLatestPrice(ticker);
+          if (callback) callback({ success: true, data: price });
+        } catch (error) {
+          if (callback) callback({ success: false, error: error.message });
+        }
+      });
+
+      // Disconnect handler
       socket.on('disconnect', () => {
         this._handleDisconnect(socket);
-        console.log(`[WS] Client disconnected: ${socket.id}`);
-      });
+        this.activeSockets.delete(socket.id);
+        logger.info({ socketId: socket.id, totalConnections: this.activeSockets.size }, '[WS] Client disconnected');
 
-      socket.on('get-price', async (ticker, callback) => {
-        const price = await this.getLatestPrice(ticker);
-        if (callback) callback(price);
-      });
-
-      socket.on('get-watchlist', async (callback) => {
-        // Will be populated from database
-        if (callback) callback([]);
+        // Stop master loop if no more subscriptions
+        if (this.subscriptions.size === 0 && this.masterLoopInterval) {
+          this._stopMasterLoop();
+        }
       });
     });
+
+    // Start master loop after setup
+    this._startMasterLoop();
   }
 
+  /**
+   * Subscribe socket to a ticker
+   */
   _subscribeTicker(socket, ticker) {
     if (!this.subscriptions.has(ticker)) {
       this.subscriptions.set(ticker, new Set());
-      this._startPriceStream(ticker);
+      logger.info({ ticker }, '[WS] New ticker subscription');
     }
+
     this.subscriptions.get(ticker).add(socket.id);
-    console.log(`[WS] Socket ${socket.id} subscribed to ${ticker}`);
-    
-    // Send cached price immediately
-    if (this.priceCache.has(ticker)) {
-      socket.emit('price-update', this.priceCache.get(ticker));
-    }
+    logger.info({ ticker, socketId: socket.id, subscribers: this.subscriptions.get(ticker).size }, '[WS] Socket subscribed');
   }
 
+  /**
+   * Unsubscribe socket from ticker
+   */
   _unsubscribeTicker(socket, ticker) {
     if (this.subscriptions.has(ticker)) {
       this.subscriptions.get(ticker).delete(socket.id);
+
+      // Clean up empty ticker subscriptions
       if (this.subscriptions.get(ticker).size === 0) {
         this.subscriptions.delete(ticker);
+        logger.info({ ticker }, '[WS] Ticker unsubscribed (no more subscribers)');
       }
     }
-    console.log(`[WS] Socket ${socket.id} unsubscribed from ${ticker}`);
   }
 
+  /**
+   * Handle socket disconnection - clean up all subscriptions
+   */
   _handleDisconnect(socket) {
     for (const [ticker, sockets] of this.subscriptions.entries()) {
       sockets.delete(socket.id);
@@ -69,51 +102,92 @@ class WebSocketService {
     }
   }
 
-  _startPriceStream(ticker) {
-    console.log(`[WS] Starting price stream for ${ticker}`);
-    
-    // Update prices every 5 seconds
-    setInterval(async () => {
-      if (!this.subscriptions.has(ticker)) return;
+  /**
+   * SINGLE MASTER LOOP - Fetches all prices once, broadcasts to all subscribers
+   * This is the KEY improvement: N subscribers don't create N API calls
+   * MARKET HOURS AWARE: Only updates during 9:15 AM - 3:30 PM IST
+   */
+  _startMasterLoop() {
+    if (this.masterLoopInterval) return; // Already running
+
+    logger.info('[WS] Starting master loop');
+
+    this.masterLoopInterval = setInterval(async () => {
+      // Skip update if market is closed (after 3:30 PM IST)
+      if (!isMarketOpen()) {
+        logger.debug('[WS] Market closed, skipping price update');
+        return;
+      }
+
+      if (this.subscriptions.size === 0) {
+        // No subscribers, skip this iteration
+        return;
+      }
 
       try {
-        const price = await this.getLatestPrice(ticker);
-        this.priceCache.set(ticker, price);
-        
-        // Broadcast to all subscribed clients
-        const socketIds = Array.from(this.subscriptions.get(ticker) || []);
-        socketIds.forEach(socketId => {
-          this.io.to(socketId).emit('price-update', price);
+        // Fetch all subscribed tickers in a SINGLE batch call
+        const tickers = Array.from(this.subscriptions.keys());
+        const priceData = await marketDataService.getPricesBatch(tickers);
+
+        // Broadcast to subscribers (fan-out)
+        priceData.forEach((priceUpdate) => {
+          if (this.subscriptions.has(priceUpdate.ticker)) {
+            const subscribers = this.subscriptions.get(priceUpdate.ticker);
+            subscribers.forEach((socketId) => {
+              this.io.to(socketId).emit('price-update', {
+                ticker: priceUpdate.ticker,
+                price: priceUpdate.price,
+                change: priceUpdate.change,
+                changePercent: priceUpdate.changePercent,
+                high: priceUpdate.high,
+                low: priceUpdate.low,
+                volume: priceUpdate.volume,
+                source: priceUpdate.source,
+                timestamp: priceUpdate.timestamp,
+              });
+            });
+          }
         });
+
+        logger.debug({ tickers: tickers.length, subscribers: this.activeSockets.size }, '[WS] Broadcast complete');
       } catch (error) {
-        console.error(`[WS] Error fetching price for ${ticker}:`, error.message);
+        logger.error({ error: error.message }, '[WS] Master loop error');
       }
-    }, 5000);
+    }, this.updateInterval);
   }
 
-  async getLatestPrice(ticker) {
-    try {
-      const yahooFinance = await getYahooFinance();
-    const quote = await yahooFinance.quote(ticker);
-      return {
-        ticker,
-        price: quote.regularMarketPrice,
-        change: quote.regularMarketChange,
-        changePercent: quote.regularMarketChangePercent,
-        volume: quote.regularMarketVolume,
-        timestamp: new Date().toISOString(),
-        high: quote.regularMarketDayHigh,
-        low: quote.regularMarketDayLow,
-        open: quote.regularMarketOpen
-      };
-    } catch (error) {
-      console.error(`Error fetching price for ${ticker}:`, error.message);
-      return null;
+  /**
+   * Stop the master loop (when no more subscribers)
+   * IMPORTANT: Prevents memory leaks by cleaning up the interval
+   */
+  _stopMasterLoop() {
+    if (this.masterLoopInterval) {
+      clearInterval(this.masterLoopInterval);
+      this.masterLoopInterval = null;
+      logger.info('[WS] Master loop stopped and cleaned up');
     }
   }
 
+  /**
+   * Broadcast market-wide updates (gainers/losers, market status)
+   */
   broadcastMarketUpdate(data) {
-    this.io.emit('market-update', data);
+    this.io.emit('market-update', {
+      ...data,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Get current connection stats (for monitoring)
+   */
+  getStats() {
+    return {
+      activeConnections: this.activeSockets.size,
+      subscribedTickers: this.subscriptions.size,
+      totalSubscriptions: Array.from(this.subscriptions.values()).reduce((sum, set) => sum + set.size, 0),
+      masterLoopRunning: this.masterLoopInterval !== null,
+    };
   }
 }
 

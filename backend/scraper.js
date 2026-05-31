@@ -1,25 +1,7 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { getYahooFinance } = require('./utils/yahooClient');
-
-// Curated list of prominent Nifty 50 Blue Chips to track as Market Leaders
-const NIFTY_BLUE_CHIPS = [
-  'RELIANCE.NS', // Reliance Industries
-  'TCS.NS',      // Tata Consultancy Services
-  'HDFCBANK.NS', // HDFC Bank
-  'INFY.NS',     // Infosys
-  'SBIN.NS',     // State Bank of India
-  'TATAMOTORS.NS', // Tata Motors
-  'ICICIBANK.NS', // ICICI Bank
-  'LT.NS',       // Larsen & Toubro
-  'ITC.NS',      // ITC Limited
-  'BHARTIARTL.NS', // Bharti Airtel
-  'AXISBANK.NS', // Axis Bank
-  'TATASTEEL.NS', // Tata Steel
-  'WIPRO.NS',    // Wipro
-  'HCLTECH.NS',  // HCL Technologies
-  'ADANIENT.NS'  // Adani Enterprises
-];
+const { getNifty50Symbols, getRandomSymbols } = require('./utils/niftySymbols');
 
 /**
  * Maps a Moneycontrol company name to its corresponding Yahoo Finance NSE or BSE ticker symbol
@@ -71,10 +53,12 @@ async function scrapeMoneycontrolCategory(categoryType) {
 
   try {
     const response = await axios.get(url, {
+      timeout: 12000,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-IN,en;q=0.9',
+        'Cache-Control': 'no-cache',
       }
     });
 
@@ -101,7 +85,6 @@ async function scrapeMoneycontrolCategory(categoryType) {
         const changeTextVal = changeSpan.text().trim();
         
         // Clean up change percentage and numeric formats
-        // Format of span text: "1.68 (9.41%)" or "-75.10 (-10.67%)"
         let changePercent = 0;
         let changeRupees = '0.00';
         
@@ -116,11 +99,11 @@ async function scrapeMoneycontrolCategory(categoryType) {
         // High & Low are in Col 3 and Col 4
         const high = cells.eq(3).text().trim();
         const low = cells.eq(4).text().trim();
-        const volume = cells.eq(6).text().trim() || 'N/A'; // VWAP or Volume
+        const volume = cells.eq(6).text().trim() || 'N/A';
 
         if (companyName && priceVal) {
           stocks.push({
-            tickerName: companyName, // Keep Moneycontrol name to resolve later
+            tickerName: companyName,
             company: companyName,
             price: parseFloat(priceVal.replace(/,/g, '')) || priceVal,
             change: changeTextVal ? `${changePercent > 0 ? '+' : ''}${changePercent.toFixed(2)}%` : '0.00%',
@@ -130,7 +113,7 @@ async function scrapeMoneycontrolCategory(categoryType) {
             low: parseFloat(low.replace(/,/g, '')) || low,
             volume: volume,
             country: 'India',
-            industry: 'N/A' // Resolved later in recommendation engine
+            industry: 'N/A'
           });
         }
       }
@@ -145,19 +128,24 @@ async function scrapeMoneycontrolCategory(categoryType) {
 }
 
 /**
- * Compiles a live list of Nifty 50 leaders with real-time stats
+ * Fetches live Nifty 50 market leaders with real-time quotes from Yahoo Finance.
+ * Uses the curated symbol pool — no hardcoded prices.
  */
 async function getNiftyMarketLeaders() {
+  const yahooFinance = await getYahooFinance(); // FIXED: was missing this call
   const leaders = [];
+  // Use only top 15 blue chips for fast response
+  const symbols = getNifty50Symbols().slice(0, 15);
   
-  for (const symbol of NIFTY_BLUE_CHIPS) {
+  for (const symbol of symbols) {
     try {
       const q = await yahooFinance.quote(symbol);
+      if (!q || !q.regularMarketPrice) continue;
       leaders.push({
         ticker: symbol,
         company: q.longName || q.shortName || symbol.replace('.NS', ''),
         price: q.regularMarketPrice || 0,
-        change: `${q.regularMarketChangePercent >= 0 ? '+' : ''}${q.regularMarketChangePercent?.toFixed(2)}%` || '0.00%',
+        change: `${(q.regularMarketChangePercent || 0) >= 0 ? '+' : ''}${(q.regularMarketChangePercent || 0).toFixed(2)}%`,
         changePercent: q.regularMarketChangePercent || 0,
         volume: formatVolume(q.regularMarketVolume),
         marketCap: formatMarketCap(q.marketCap),
@@ -172,11 +160,55 @@ async function getNiftyMarketLeaders() {
   return leaders;
 }
 
+/**
+ * Fetches top gainers / losers dynamically from Yahoo Finance screener as a fallback.
+ * Called when Moneycontrol scraping fails.
+ * @param {'gainers'|'losers'} type
+ * @returns {Array}
+ */
+async function fetchYahooFinanceMoversFallback(type = 'gainers') {
+  const yahooFinance = await getYahooFinance();
+  const results = [];
+  
+  // Use a focused subset of top blue chips for fast response
+  const symbols = getNifty50Symbols().slice(0, 20);
+  const quotes = [];
+  
+  for (const symbol of symbols) {
+    try {
+      const q = await yahooFinance.quote(symbol);
+      if (!q || !q.regularMarketPrice) continue;
+      quotes.push({
+        ticker: symbol,
+        company: q.longName || q.shortName || symbol.replace('.NS', ''),
+        price: q.regularMarketPrice,
+        change: `${(q.regularMarketChangePercent || 0) >= 0 ? '+' : ''}${(q.regularMarketChangePercent || 0).toFixed(2)}%`,
+        changePercent: q.regularMarketChangePercent || 0,
+        high: q.regularMarketDayHigh || q.regularMarketPrice,
+        low: q.regularMarketDayLow || q.regularMarketPrice,
+        volume: formatVolume(q.regularMarketVolume),
+        country: 'India',
+        industry: q.industry || 'N/A'
+      });
+    } catch (e) {
+      // Skip failed quotes
+    }
+  }
+  
+  // Sort by absolute change percent
+  quotes.sort((a, b) => {
+    if (type === 'gainers') return b.changePercent - a.changePercent;
+    return a.changePercent - b.changePercent;
+  });
+  
+  return quotes.slice(0, 15);
+}
+
 // Utility to format Volume in Lakhs/Crores or Standard suffixes for Indian markets
 function formatVolume(vol) {
   if (!vol) return 'N/A';
-  if (vol >= 1.0e7) return (vol / 1.0e7).toFixed(2) + ' Cr'; // 1 Crore = 10 Million
-  if (vol >= 1.0e5) return (vol / 1.0e5).toFixed(2) + ' L';  // 1 Lakh = 100,000
+  if (vol >= 1.0e7) return (vol / 1.0e7).toFixed(2) + ' Cr';
+  if (vol >= 1.0e5) return (vol / 1.0e5).toFixed(2) + ' L';
   if (vol >= 1.0e3) return (vol / 1.0e3).toFixed(2) + ' K';
   return vol.toString();
 }
@@ -184,7 +216,6 @@ function formatVolume(vol) {
 // Utility to format Market Cap in Crores/Trillions
 function formatMarketCap(cap) {
   if (!cap) return 'N/A';
-  // Convert INR market cap to Crores (1 Crore = 10^7 Rupees)
   if (cap >= 1.0e7) return '₹' + (cap / 1.0e7).toFixed(0) + ' Cr';
   return '₹' + cap.toString();
 }
@@ -193,6 +224,7 @@ module.exports = {
   scrapeMoneycontrolCategory,
   getNiftyMarketLeaders,
   searchIndianTicker,
+  fetchYahooFinanceMoversFallback,
   formatVolume,
   formatMarketCap
 };

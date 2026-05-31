@@ -1,0 +1,35 @@
+// Additional models for orders and execution
+
+model Order {
+  id                    String            @id @default(cuid())
+  portfolioId           String
+  portfolio             Portfolio         @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+  positionId            String?           // linked when executed
+  position              Position?         @relation(fields: [positionId], references: [id], onDelete: SetNull)
+  userId                String
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  ticker                String
+  side                  String            // BUY or SELL
+  type                  String            // MARKET, LIMIT, STOP_LOSS, TRAILING_STOP, OCO
+  status                String            @default("PENDING") // PENDING, PARTIALLY_FILLED, FILLED, CANCELLED
+
+  // Price params
+  limitPrice            Decimal?          @db.Numeric(12,2)
+  stopPrice             Decimal?          @db.Numeric(12,2)
+  trailingPct           Decimal?          @db.Numeric(5,2) // trailing stop percent
+
+  quantity              Int
+  filledQuantity        Int               @default(0)
+
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  executedAt            DateTime?
+
+  linkedOrderId         String?           // for OCO - reference to the paired order
+
+  @@index([portfolioId])
+  @@index([userId])
+  @@index([ticker])
+  @@index([status])
+}

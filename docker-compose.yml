@@ -1,0 +1,48 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stockscreener-backend
+    env_file:
+      - ./backend/.env
+    ports:
+      - '5000:5000'
+    depends_on:
+      - db
+    networks:
+      - stockscreener-net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: stockscreener-frontend
+    ports:
+      - '3000:80'
+    depends_on:
+      - backend
+    networks:
+      - stockscreener-net
+
+  db:
+    image: postgres:15-alpine
+    container_name: stockscreener-db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: stockscreener
+    ports:
+      - '5432:5432'
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - stockscreener-net
+
+networks:
+  stockscreener-net:
+    driver: bridge
+
+volumes:
+  db_data:

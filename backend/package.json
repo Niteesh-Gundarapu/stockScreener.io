@@ -1,29 +1,40 @@
 {
   "name": "backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:migrate:deploy": "prisma migrate deploy"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Production-Ready Stock Trading Platform for NSE/BSE",
   "dependencies": {
+    "@prisma/client": "^5.0.0",
     "axios": "^1.6.0",
-    "cheerio": "^1.0.0",
+    "bcryptjs": "^2.4.3",
+    "cheerio": "^1.2.0",
     "cors": "^2.8.5",
     "dotenv": "^16.0.0",
     "express": "^4.18.0",
-    "yahoo-finance2": "^2.11.0",
-    "socket.io": "^4.5.0",
+    "express-rate-limit": "^7.0.0",
+    "joi": "^17.10.0",
+    "jsonwebtoken": "^9.0.0",
     "mongoose": "^7.0.0",
-    "bcryptjs": "^2.4.3",
-    "jsonwebtoken": "^9.0.0"
+    "pg": "^8.11.0",
+    "pino": "^8.15.0",
+    "redis": "^4.6.0",
+    "socket.io": "^4.5.0",
+    "socket.io-redis": "^6.1.0",
+    "yahoo-finance2": "^2.11.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "nodemon": "^3.1.14",
+    "prisma": "^5.0.0"
   }
 }

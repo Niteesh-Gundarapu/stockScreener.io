@@ -1,0 +1,266 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// USER & AUTHENTICATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+model User {
+  id                    String            @id @default(cuid())
+  email                 String            @unique
+  passwordHash          String
+  username              String            @unique
+  
+  // Profile
+  displayName           String?
+  profileImage          String?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  lastLoginAt           DateTime?
+  
+  // Status
+  isActive              Boolean           @default(true)
+  emailVerified         Boolean           @default(false)
+  
+  // Relations
+  portfolios            Portfolio[]
+  trades                Trade[]
+  priceAlerts           PriceAlert[]
+  orders                Order[]
+  sessions              Session[]
+  auditLogs             AuditLog[]
+  
+  @@index([email])
+  @@index([username])
+}
+
+model Session {
+  id                    String            @id @default(cuid())
+  userId                String
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  token                 String            @unique
+  expiresAt             DateTime
+  createdAt             DateTime          @default(now())
+  
+  @@index([userId])
+  @@index([token])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PORTFOLIO & TRADING
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Portfolio {
+  id                    String            @id @default(cuid())
+  userId                String            @unique
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Account Balances
+  cashBalance           Decimal           @default(100000) @db.Decimal(15, 2)  // ₹100,000 paper trading
+  totalValue            Decimal           @default(100000) @db.Decimal(15, 2)
+  totalInvested         Decimal           @default(0) @db.Decimal(15, 2)
+  totalGainLoss         Decimal           @default(0) @db.Decimal(15, 2)
+  totalGainLossPercent  Decimal           @default(0) @db.Decimal(8, 2)
+  
+  // Metadata
+  accountType           String            @default("PAPER_TRADING")  // PAPER_TRADING, LIVE
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  
+  // Relations
+  positions             Position[]
+  trades                Trade[]
+  orders                Order[]
+  
+  @@index([userId])
+}
+
+model Position {
+  id                    String            @id @default(cuid())
+  portfolioId           String
+  portfolio             Portfolio         @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+  
+  ticker                String            // e.g., "RELIANCE.NS"
+  quantity              Int
+  avgPrice              Decimal           @db.Decimal(12, 2)
+  currentPrice          Decimal           @db.Decimal(12, 2)
+  
+  // P&L Tracking
+  gainLoss              Decimal           @default(0) @db.Decimal(15, 2)
+  gainLossPercent       Decimal           @default(0) @db.Decimal(8, 2)
+  
+  // Leverage & Margin
+  leverage              Int               @default(1)  // 1x (cash), 2x, 3x, 4x, 5x
+  marginUsed            Decimal           @default(0) @db.Decimal(15, 2)
+  marginRequired        Decimal           @default(0) @db.Decimal(15, 2)
+  
+  // Intraday Flag
+  isIntraday            Boolean           @default(false)
+  
+  // Metadata
+  buyDate               DateTime
+  updatedAt             DateTime          @updatedAt
+  
+  // Relations
+  orders                Order[]
+  
+  @@unique([portfolioId, ticker])
+  @@index([portfolioId])
+  @@index([ticker])
+}
+
+model Trade {
+  id                    String            @id @default(cuid())
+  portfolioId           String
+  portfolio             Portfolio         @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+  userId                String
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Trade Details
+  ticker                String            // e.g., "RELIANCE.NS"
+  tradeType             String            // BUY, SELL
+  quantity              Int
+  price                 Decimal           @db.Decimal(12, 2)
+  totalAmount           Decimal           @db.Decimal(15, 2)
+  
+  // Execution
+  status                String            @default("FILLED")  // PENDING, FILLED, CANCELLED
+  executedAt            DateTime          @default(now())
+  
+  // Commission (future)
+  commission            Decimal           @default(0) @db.Decimal(10, 2)
+  
+  @@index([portfolioId])
+  @@index([userId])
+  @@index([ticker])
+  @@index([executedAt])
+}
+
+model PriceAlert {
+  id                    String            @id @default(cuid())
+  userId                String
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  ticker                String            // e.g., "RELIANCE.NS"
+  alertType             String            // ABOVE, BELOW
+  targetPrice           Decimal           @db.Decimal(12, 2)
+  
+  isActive              Boolean           @default(true)
+  triggeredAt           DateTime?
+  createdAt             DateTime          @default(now())
+  
+  @@index([userId])
+  @@index([ticker])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARKET DATA & CACHE
+// ═══════════════════════════════════════════════════════════════════════════
+
+model MarketDataCache {
+  id                    String            @id @default(cuid())
+  
+  ticker                String            @unique
+  company               String
+  exchange              String            // NSE, BSE
+  
+  // Latest Quote
+  currentPrice          Decimal           @db.Decimal(12, 2)
+  change                Decimal           @db.Decimal(10, 2)
+  changePercent         Decimal           @db.Decimal(8, 2)
+  
+  // OHLC
+  open                  Decimal           @db.Decimal(12, 2)
+  high                  Decimal           @db.Decimal(12, 2)
+  low                   Decimal           @db.Decimal(12, 2)
+  close                 Decimal           @db.Decimal(12, 2)
+  
+  // Volume & Stats
+  volume                BigInt            @default(0)
+  averageVolume         BigInt            @default(0)
+  marketCap             BigInt?
+  peRatio               Decimal?          @db.Decimal(8, 2)
+  
+  // 52-Week Range
+  fiftyTwoWeekHigh      Decimal           @db.Decimal(12, 2)
+  fiftyTwoWeekLow       Decimal           @db.Decimal(12, 2)
+  
+  // Cache Management
+  lastUpdated           DateTime          @updatedAt
+  dataSource            String            // YAHOO, FINNHUB, CACHE
+  
+  @@index([ticker])
+  @@index([lastUpdated])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUDIT & LOGGING
+// ═══════════════════════════════════════════════════════════════════════════
+
+model AuditLog {
+  id                    String            @id @default(cuid())
+  userId                String
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  action                String            // LOGIN, LOGOUT, BUY, SELL, etc.
+  resource              String?           // Which resource was affected
+  resourceId            String?           // ID of the resource
+  
+  details               String?           // JSON string of details
+  ipAddress             String?
+  userAgent             String?
+  
+  createdAt             DateTime          @default(now())
+  
+  @@index([userId])
+  @@index([createdAt])
+  @@index([action])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ORDER MODEL (Phase 3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Order {
+  id                    String            @id @default(cuid())
+  portfolioId           String
+  portfolio             Portfolio         @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+  positionId            String?           // linked when executed
+  position              Position?         @relation(fields: [positionId], references: [id], onDelete: SetNull)
+  userId                String
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  ticker                String
+  side                  String            // BUY or SELL
+  type                  String            // MARKET, LIMIT, STOP_LOSS, TRAILING_STOP, OCO
+  status                String            @default("PENDING") // PENDING, PARTIALLY_FILLED, FILLED, CANCELLED
+
+  // Price params
+  limitPrice            Decimal?          @db.Decimal(12,2)
+  stopPrice             Decimal?          @db.Decimal(12,2)
+  trailingPct           Decimal?          @db.Decimal(5,2) // trailing stop percent
+
+  quantity              Int
+  filledQuantity        Int               @default(0)
+
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  executedAt            DateTime?
+
+  linkedOrderId         String?           // for OCO - reference to the paired order
+
+  @@index([portfolioId])
+  @@index([userId])
+  @@index([ticker])
+  @@index([status])
+}

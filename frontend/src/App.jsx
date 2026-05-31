@@ -28,7 +28,7 @@ import {
   CartesianGrid 
 } from 'recharts';
 
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000/api';
 
 function StockIntelligencePanel({ stock }) {
   if (!stock || !stock.newsCatalysts) return null;
@@ -720,7 +720,11 @@ function App() {
                   <div className="picks-grid">
                     {picksData.avoid.map(pick => {
                       const isExpanded = expandedPickTicker === pick.ticker;
-                      const isPositive = !pick.change.startsWith('-');
+                      // FIX: use pick-local live values, not outer scope livePrice/liveChange
+                      const avoidLivePrice = getLiveValue(pick.ticker, 'price', pick.price);
+                      const avoidLiveChange = getLiveValue(pick.ticker, 'changePercent', pick.changePercent);
+                      const avoidChangeStr = typeof pick.change === 'string' ? pick.change : `${(pick.changePercent || 0) >= 0 ? '+' : ''}${(pick.changePercent || 0).toFixed(2)}%`;
+                      const isPositive = !avoidChangeStr.startsWith('-');
                       
                       return (
                         <div 
@@ -742,9 +746,9 @@ function App() {
 
                             <div style={{ textAlign: 'right' }}>
                               <div className="pick-price-row">
-                                <span className="pick-price">₹{livePrice?.toFixed ? livePrice.toFixed(2) : livePrice}</span>
+                                <span className="pick-price">₹{avoidLivePrice?.toFixed ? avoidLivePrice.toFixed(2) : avoidLivePrice}</span>
                                 <span className={`pick-change ${isPositive ? 'change-positive' : 'change-negative'}`}>
-                                  {typeof liveChange === 'number' ? `${liveChange >= 0 ? '+' : ''}${liveChange.toFixed(2)}%` : liveChange}
+                                  {typeof avoidLiveChange === 'number' ? `${avoidLiveChange >= 0 ? '+' : ''}${avoidLiveChange.toFixed(2)}%` : avoidChangeStr}
                                 </span>
                               </div>
                               <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>NSE Live Price</span>
@@ -897,7 +901,8 @@ function App() {
                   </h4>
                   <div style={{ display: 'flex', gap: '1rem', overflowX: 'auto', paddingBottom: '0.25rem' }}>
                     {trendingData.map(t => {
-                      const trendPos = !t.change.startsWith('-');
+                      const trendChangeStr = typeof t.change === 'string' ? t.change : `${(t.changePercent || 0) >= 0 ? '+' : ''}${(t.changePercent || 0).toFixed(2)}%`;
+                      const trendPos = !trendChangeStr.startsWith('-');
                       return (
                         <div 
                           key={t.ticker} 
@@ -905,9 +910,9 @@ function App() {
                           onClick={() => handleLoadResearchSymbol(t.ticker)}
                           style={{ minWidth: '160px', cursor: 'pointer', flexShrink: 0, background: 'rgba(255,255,255,0.01)', border: '1px solid rgba(255,255,255,0.04)' }}
                         >
-                          <div style={{ display: 'flex', justifycontent: 'space-between', alignItems: 'center' }}>
-                            <span style={{ fontWeight: 700, color: '#fff', fontFamily: 'var(--font-mono)', fontSize: '0.85rem' }}>{t.ticker.replace('.NS', '')}</span>
-                            <span style={{ fontSize: '0.7rem', fontWeight: 600 }} className={trendPos ? 'change-positive' : 'change-negative'}>{t.change}</span>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <span style={{ fontWeight: 700, color: '#fff', fontFamily: 'var(--font-mono)', fontSize: '0.85rem' }}>{t.ticker.replace('.NS', '').replace('.BO', '')}</span>
+                            <span style={{ fontSize: '0.7rem', fontWeight: 600 }} className={trendPos ? 'change-positive' : 'change-negative'}>{trendChangeStr}</span>
                           </div>
                           <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: '2px' }}>{t.company}</div>
                           <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#fff', marginTop: '4px', fontFamily: 'var(--font-mono)' }}>₹{t.price.toFixed(2)}</div>
@@ -953,27 +958,33 @@ function App() {
                       </thead>
                       <tbody>
                         {marketData[activeMarketFilter] && marketData[activeMarketFilter].map((stock, i) => {
-                          const stockPos = !stock.change.startsWith('-');
+                          const stockChangeStr = typeof stock.change === 'string' ? stock.change : `${(stock.changePercent || 0) >= 0 ? '+' : ''}${(stock.changePercent || 0).toFixed(2)}%`;
+                          const stockPos = !stockChangeStr.startsWith('-');
+                          // Use resolved ticker if available, else fall back to searching by company name
+                          const researchTarget = stock.ticker || stock.tickerName || stock.company;
                           return (
                             <tr key={`${stock.company}-${i}`}>
-                              <td className="market-table-ticker" style={{ color: '#fff', fontSize: '0.95rem' }}>{stock.company}</td>
+                              <td className="market-table-ticker" style={{ color: '#fff', fontSize: '0.95rem' }}>
+                                {stock.ticker && <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--accent-blue)', marginRight: '6px' }}>{stock.ticker.replace('.NS','').replace('.BO','')}</span>}
+                                {stock.company}
+                              </td>
                               <td className="market-table-num" style={{ textAlign: 'right', fontWeight: 600, color: '#fff' }}>
                                 ₹{typeof stock.price === 'number' ? stock.price.toLocaleString('en-IN', {minimumFractionDigits: 2}) : stock.price}
                               </td>
                               <td className={`market-table-num ${stockPos ? 'change-positive' : 'change-negative'}`} style={{ textAlign: 'right', fontWeight: 600 }}>
-                                {stock.change}
+                                {stockChangeStr}
                               </td>
                               <td className="market-table-num" style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                                ₹{stock.high}
+                                {stock.high ? `₹${stock.high}` : '—'}
                               </td>
                               <td className="market-table-num" style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                                ₹{stock.low}
+                                {stock.low ? `₹${stock.low}` : '—'}
                               </td>
                               <td className="market-table-num" style={{ textAlign: 'right', color: 'var(--text-muted)' }}>{stock.volume}</td>
                               <td>
                                 <button 
                                   className="btn btn-secondary" 
-                                  onClick={() => handleLoadResearchSymbol(stock.company)}
+                                  onClick={() => handleLoadResearchSymbol(researchTarget)}
                                   style={{ padding: '0.25rem 0.5rem', fontSize: '0.7rem', borderRadius: '4px' }}
                                 >
                                   Research

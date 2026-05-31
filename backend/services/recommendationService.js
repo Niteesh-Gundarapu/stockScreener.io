@@ -6,6 +6,10 @@ class RecommendationService {
     this.analyticsService = new AnalyticsService();
   }
 
+  async sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
   async generateSmartRecommendations(tickers, avoidList = []) {
     try {
       const recommendations = [];
@@ -56,6 +60,10 @@ class RecommendationService {
           }
         } catch (error) {
           console.error(`Error generating recommendation for ${ticker}:`, error.message);
+        }
+
+        if (tickers.indexOf(ticker) < tickers.length - 1) {
+          await this.sleep(300);
         }
       }
 
