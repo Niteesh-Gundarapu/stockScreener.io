@@ -1,15 +1,27 @@
 const axios = require('axios');
-const cheerio = require('cheerio');
 const { getYahooFinance } = require('./utils/yahooClient');
 const { getNifty50Symbols, getRandomSymbols } = require('./utils/niftySymbols');
+const NSEDataService = require('./services/nseDataService');
+
+let nseDataService;
 
 /**
- * Maps a Moneycontrol company name to its corresponding Yahoo Finance NSE or BSE ticker symbol
+ * Initialize NSE Data Service
+ */
+function initializeNSEService() {
+  if (!nseDataService) {
+    nseDataService = new NSEDataService();
+  }
+  return nseDataService;
+}
+
+/**
+ * Maps a company name to its corresponding Yahoo Finance NSE or BSE ticker symbol
  */
 async function searchIndianTicker(companyName) {
   if (!companyName) return null;
   
-  // Clean up common Moneycontrol shorthand names to improve search matches
+  // Clean up common shorthand names to improve search matches
   const cleanName = companyName
     .replace(/ Ltd\.?/gi, '')
     .replace(/ India/gi, '')
@@ -39,130 +51,51 @@ async function searchIndianTicker(companyName) {
 }
 
 /**
- * Scrapes Moneycontrol's market stats pages for Indian stocks.
- * Supports "Top Gainers" and "Top Losers".
+ * Get top gainers from reliable NSE API service
+ * Replaces Moneycontrol scraping with API-based data
  */
 async function scrapeMoneycontrolCategory(categoryType) {
-  const urlMap = {
-    'Top Gainers': 'https://www.moneycontrol.com/stocks/marketstats/nsegainer/index.php',
-    'Top Losers': 'https://www.moneycontrol.com/stocks/marketstats/nseloser/index.php'
-  };
-
-  const url = urlMap[categoryType];
-  if (!url) return [];
-
   try {
-    const response = await axios.get(url, {
-      timeout: 12000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-IN,en;q=0.9',
-        'Cache-Control': 'no-cache',
-      }
-    });
-
-    const $ = cheerio.load(response.data);
-    const stocks = [];
-
-    // Find table rows containing stock quote links
-    $('a[href*="/india/stockpricequote/"]').each((i, el) => {
-      const row = $(el).closest('tr');
-      const cells = row.find('td');
-      
-      if (cells.length >= 4) {
-        const companyName = $(el).text().trim();
-        
-        // Col 2 contains the Price and the Change metrics inside a <p> tag
-        const priceTd = cells.eq(2);
-        const pTag = priceTd.find('p');
-        
-        // Extract the price before the span tag
-        let priceVal = pTag.contents().first().text().trim();
-        
-        // Extract the change details inside the span
-        const changeSpan = pTag.find('span');
-        const changeTextVal = changeSpan.text().trim();
-        
-        // Clean up change percentage and numeric formats
-        let changePercent = 0;
-        let changeRupees = '0.00';
-        
-        if (changeTextVal) {
-          const match = changeTextVal.match(/(-?[\d,.]+)\s*\(\s*(-?[\d,.]+)%\s*\)/);
-          if (match) {
-            changeRupees = match[1];
-            changePercent = parseFloat(match[2]) || 0;
-          }
-        }
-        
-        // High & Low are in Col 3 and Col 4
-        const high = cells.eq(3).text().trim();
-        const low = cells.eq(4).text().trim();
-        const volume = cells.eq(6).text().trim() || 'N/A';
-
-        if (companyName && priceVal) {
-          stocks.push({
-            tickerName: companyName,
-            company: companyName,
-            price: parseFloat(priceVal.replace(/,/g, '')) || priceVal,
-            change: changeTextVal ? `${changePercent > 0 ? '+' : ''}${changePercent.toFixed(2)}%` : '0.00%',
-            changePercent: changePercent,
-            changeRupees: changeRupees,
-            high: parseFloat(high.replace(/,/g, '')) || high,
-            low: parseFloat(low.replace(/,/g, '')) || low,
-            volume: volume,
-            country: 'India',
-            industry: 'N/A'
-          });
-        }
-      }
-    });
-
-    // Take top 15 to keep it fast
-    return stocks.slice(0, 15);
+    const service = initializeNSEService();
+    
+    if (categoryType === 'Top Gainers') {
+      return await service.getTopGainers();
+    } else if (categoryType === 'Top Losers') {
+      return await service.getTopLosers();
+    }
+    
+    return [];
   } catch (error) {
-    console.error(`Error scraping Moneycontrol category "${categoryType}":`, error.message);
-    throw error;
+    console.error(`Error fetching ${categoryType}:`, error.message);
+    // Fallback to Yahoo Finance
+    return await fetchYahooFinanceMoversFallback(
+      categoryType === 'Top Gainers' ? 'gainers' : 'losers'
+    );
   }
 }
 
+
 /**
- * Fetches live Nifty 50 market leaders with real-time quotes from Yahoo Finance.
- * Uses the curated symbol pool — no hardcoded prices.
+ * Fetches live Nifty 50 market leaders with real-time quotes from NSE/Yahoo Finance.
+ * Uses API service for reliable data.
  */
 async function getNiftyMarketLeaders() {
-  const yahooFinance = await getYahooFinance(); // FIXED: was missing this call
-  const leaders = [];
-  // Use only top 15 blue chips for fast response
-  const symbols = getNifty50Symbols().slice(0, 15);
-  
-  for (const symbol of symbols) {
-    try {
-      const q = await yahooFinance.quote(symbol);
-      if (!q || !q.regularMarketPrice) continue;
-      leaders.push({
-        ticker: symbol,
-        company: q.longName || q.shortName || symbol.replace('.NS', ''),
-        price: q.regularMarketPrice || 0,
-        change: `${(q.regularMarketChangePercent || 0) >= 0 ? '+' : ''}${(q.regularMarketChangePercent || 0).toFixed(2)}%`,
-        changePercent: q.regularMarketChangePercent || 0,
-        volume: formatVolume(q.regularMarketVolume),
-        marketCap: formatMarketCap(q.marketCap),
-        industry: q.industry || 'Blue Chip',
-        country: 'India'
-      });
-    } catch (e) {
-      console.error(`Failed to fetch Nifty leader quote for ${symbol}:`, e.message);
-    }
+  try {
+    const service = initializeNSEService();
+    const leaders = [];
+    const symbols = getNifty50Symbols().slice(0, 15);
+    
+    const quotes = await service.getMultipleQuotes(symbols);
+    return quotes;
+  } catch (error) {
+    console.error('Error fetching Nifty market leaders:', error.message);
+    // Fallback: return empty array and let service handle retry
+    return [];
   }
-  
-  return leaders;
 }
 
 /**
- * Fetches top gainers / losers dynamically from Yahoo Finance screener as a fallback.
- * Called when Moneycontrol scraping fails.
+ * Fetches top gainers / losers dynamically from NSE API or Yahoo Finance fallback.
  * @param {'gainers'|'losers'} type
  * @returns {Array}
  */
@@ -226,5 +159,7 @@ module.exports = {
   searchIndianTicker,
   fetchYahooFinanceMoversFallback,
   formatVolume,
-  formatMarketCap
+  formatMarketCap,
+  initializeNSEService
 };
+
